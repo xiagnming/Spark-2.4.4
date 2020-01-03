@@ -330,5 +330,121 @@ Spark RDD API还公开了某些操作的异步版本，例如foreachAsync for fo
 
 Spark中的某些操作会触发一个称为shuffle的事件。 shuffle是Spark的一种用于重新分配数据的机制，因此可以跨分区对数据进行不同的分组。 这通常涉及跨执行程序和机器复制数据，从而使shuffle成为复杂且昂贵的操作。
 
+#### Background
+
+要了解shuffle期间发生的情况，我们可以考虑reduceByKey操作的示例。 reduceByKey操作会生成一个新的RDD，其中将单个键的所有值组合为一个元组-该键以及针对与该键关联的所有值执行reduce函数的结果。 挑战在于，并非单个键的所有值都必须位于同一分区，甚至同一台机器上，但是必须将它们放在同一位置才能计算结果。
+
+在Spark中，数据通常不会跨分区分布到特定操作所需的位置。在计算的过程中，单个任务将在单个分区里计算。因此，将所有数据组织为一个reduceByKey的reduce任务来执行，Spark需要执行all-to-all操作。它必须从所有分区读取以找到所有键的所有值，然后将各个分区的值汇总在一起以计算每个键的最终结果，这就是shuffle。
+
+尽管新打乱的数据的每个分区中的元素集是确定的，分区本身的排序也是确定的，但是这些元素的排序是不确定的。如果一个人想要在洗牌之后得到可预测的有序数据，那么可以使用:
+- mapPartitions使用例如.sorted对每个分区进行排序
+- repartitionAndSortWithinPartitions可以有效地对分区进行排序，同时进行重新分区
+- 排序以生成全局排序的RDD
+
+能够触发shuffle的操作：repartition操作像repartition，coalesce，ByKey操作（counting除外）像groupByKey和reduceByKey，join操作像cogroup和join。
+
+#### Performance Impact
+
+由于shuffle涉及到磁盘I/O、数据序列化和网络I/O，所以Shuffle是一项昂贵的操作。要为shuffle组织数据，Spark生成任务集——map任务用于组织数据，而reduce任务集用于聚合数据。这个术语来自MapReduce，与Spark的map和reduce操作没有直接关系。
+
+在内部，单个map任务的结果会保留在内存中，知道无法容纳为止。然后，根据目标分区对它们进行排序并写入单个文件。在reduce方面，任务读取相关的已排序块。
+
+某些shuffle操作会消耗大量堆内存，因为它们使用内存中的数据结构来组织传输之前或之后的记录。具体来说，reduceByKey和aggregateByKey在map端创建这些结构，而'ByKey操作在reduce端生成这些结构。当内存存不下这些数据时，Spark会将这些表溢出到磁盘，导致磁盘I/O的额外开销和增加了垃圾收集的频率。
+
+Shuffle还会在磁盘上生成大量的中间文件。从Spark 1.3开始，这些文件将一直保留到不再使用相应的RDDs并进行垃圾收集。这样做是为了在重新计算时不需要重新创建shuffle文件。如果应用程序保留对这些rdds的引用，或者GC不经常启动，那么垃圾收集可能只会在很长一段时间之后才会发生。这意味着长时间运行的Spark作业可能会消耗大量磁盘空间。在配置Spark上下文时，临时存储目录由spark.local.dir参数指定。
+
+可以通过调整各种配置参数来调整shuffle行为。请参阅Spark配置指南中的“[shuffle Behavior](https://spark.apache.org/docs/latest/configuration.html)”一节
+
+## RDD Persistence
+
+Spark中最重要的功能之一是跨操作在内存中持久化（或缓存）数据集。 当您保留RDD时，每个节点都会将其计算的所有分区存储在内存中，并在该数据集（或从该数据集派生的数据集）上的其他操作中重用它们。 这样可以使以后的操作更快（通常快10倍以上）。 缓存是用于迭代算法和快速交互使用的关键工具。
+
+您可以使用其上的persist()或cache()方法将RDD标记为持久的。第一次在操作中计算它时，它将保存在节点的内存中。Spark的缓存是容错的——如果一个RDD的任何分区丢失了，它将使用最初创建它的转换自动重新计算。
+
+此外，每个持久化的RDD可以使用不同的存储级别进行存储，例如，允许您将数据集持久化在磁盘上，持久化在内存中，但作为序列化的Java对象（以节省空间）在节点之间复制。 通过将StorageLevel对象（Scala，Java，Python）传递给persist（）来设置这些级别。 cache（）方法是使用默认存储级别StorageLevel.MEMORY_ONLY（将反序列化的对象存储在内存中）的简写。 完整的存储级别集是：
+
+Storage Level | Meaning
+------ | ------
+MEMORY_ONLY | 反序列化保存在内存中，内存不够将不会保存，需要使用的时候再重新计算
+MEMORY_AND_DISK | 反序列化保存在内存中，内存不够保存在磁盘上
+MEMORY_ONLY_SER | 序列化方式保存在内存中，高效
+MEMORY_AND_DISK_SER | 同MEMORY_ONLY_SER，内存放不下的放在磁盘上
+DISK_ONLY | 放在磁盘上
+MEMORY_ONLY_2,MEMORY_AND_DIS_2,etc | 与上面的级别相同，但是在两个集群节点上复制每个分区。
+OFF_HEAP(experimental) | 与MEMORY_ONLY_SER类似，但是将数据存储在堆外存储器中。 这需要启用堆外内存。
+
+### Which Sorage Level to Choose?
+
+Spark的存储级别意味着在内存使用和CPU效率之间提供不同的权衡。我们建议通过以下步骤来选择一个:
+- 如果您的RDD适合默认存储级别（MEMORY_ONLY），请保持这种状态。 这是CPU效率最高的选项，允许RDD上的操作尽可能快地运行。
+- 如果不是，请尝试使用MEMORY_ONLY_SER并选择一个快速的序列化库，以使对象的空间效率更高，但访问速度仍然相当快。 （Java和Scala）
+- 除非计算数据集的函数非常昂贵，或者它们过滤了大量数据，否则不要泄漏到磁盘。否则，重新计算分区的速度可能与从磁盘读取分区的速度一样快。
+- 如果您想要快速的故障恢复（例如，如果使用Spark来处理来自Web应用程序的请求），请使用复制的存储级别。 所有存储级别都通过重新计算丢失的数据来提供完全的容错能力，但是复制的存储级别使您可以继续在RDD上运行任务，而不必等待重新计算丢失的分区。
+
+### Removing Data
+
+Spark自动监视每个节点上的缓存使用情况，并以最近最少使用（LRU）的方式丢弃旧的数据分区。 如果您想手动删除RDD而不是等待它脱离缓存，请使用RDD.unpersist（）方法。
+
+# Shared Variables
+
+通常，当传递给Spark操作(如map或reduce)的函数在远程集群节点上执行时，它会在函数中使用的所有变量的单独副本上工作。这些变量被复制到每台机器上，而对远程机器上的变量的更新不会传播回驱动程序。在任务之间支持通用的读写共享变量是低效的。但是，Spark确实为两种常见的使用模式提供了两种有限的共享变量类型:广播变量和累加器。
+
+### Broadcast Variables
+
+广播变量使程序员可以在每台计算机上保留一个只读变量，而不用随任务一起发送它的副本。 例如，可以使用它们以高效的方式为每个节点提供大型输入数据集的副本。 Spark还尝试使用有效的广播算法分配广播变量，以降低通信成本。
+
+Spark操作通过一组stages执行，stage由“shuffle”操作分隔。Spark自动广播每个阶段中任务所需的公共数据。以这种方式广播的数据以序列化的形式缓存，并在运行每个任务之前反序列化。这意味着，只有当跨多个阶段的任务需要相同的数据，或者以反序列化的形式缓存数据很重要时，显式地创建广播变量才有用。
+
+广播变量是通过调用SparkContext.broadcast（v）从变量v创建的。 广播变量是v的包装，可以通过调用value方法来访问其值。 下面的代码显示了这一点：
+```
+>>> broadcastVar = sc.broadcast([1,2,3])
+<pyspark.broadcast.Broadcast object at 0x102789f10>
+
+>>> broadcastaVar.value
+[1,2,3]
+```
+创建广播变量之后，在集群上运行的任何函数中都应使用它代替值v，以使v不会多次传送给节点。 另外，对象v在广播后不应修改，以确保所有节点都具有相同的广播变量值（例如，如果变量稍后被传送到新节点）。
+
+## Accumulators
+
+累加器是仅通过关联和交换操作“添加”的变量，因此可以有效地并行支持。 它们可用于实现计数器（如MapReduce中的计数器）或总和。 Spark本身支持数字类型的累加器，程序员可以添加对新类型的支持。
+
+作为用户，您可以创建命名或未命名的累加器。 如下图所示，一个已命名的累加器（在这种情况下为计数器）将在Web UI中显示修改该累加器的阶段。 Spark在“任务”表中显示由任务修改的每个累加器的值。
+
+通过调用SparkContext.accumulator（v）从初始值v创建一个累加器。 然后，可以使用add方法或+ =运算符将在集群上运行的任务添加到集群中。 但是，他们无法读取其值。 只有驱动程序才能使用其value方法读取累加器的值。
+```
+>>> accum = sc.accumulator(0)
+>>> accum
+Accumulator<id=0, value=0>
+
+>>> sc.parallelize([1, 2, 3, 4]).foreach(lambda x: accum.add(x))
+...
+10/09/29 18:41:08 INFO SparkContext: Tasks finished in 0.317106 s
+
+>>> accum.value
+10
+```
+尽管此代码使用了对Int类型的累加器的内置支持，但程序员也可以通过将AccumulatorParam子类化来创建自己的类型。 AccumulatorParam接口有两种方法：零用于为您的数据类型提供“零值”，以及addInPlace用于将两个值加在一起。 例如，假设我们有一个代表数学向量的Vector类，我们可以这样写：
+```
+class VectorAccumulatorParam(AccumulatorParam):
+    def zero(self, initialValue):
+       return Vector.zeros(initialValue.size)
+    def addInPlace(self, v1, v2):
+        v1 += v2
+        return v1
+# Then, create an Accumulator of this type:
+vecAccum = sc.accumulator(Vector(...), VectorAccumulatorParam())
+```
+对于仅在操作内部执行的累加器更新，Spark保证每个任务对累加器的更新将仅应用一次，即重新启动的任务不会更新该值。 在转换中，用户应注意，如果重新执行任务或作业阶段，则可能不止一次应用每个任务的更新。
+
+累加器不会更改Spark的惰性评估模型。 如果在RDD上的操作中对其进行更新，则仅当将RDD计算为操作的一部分时才更新它们的值。 因此，当在诸如map（）的惰性转换中进行累加器更新时，不能保证执行更新。 下面的代码片段演示了此属性：
+```
+accum = sc.accumulatro(0)
+def g(x):
+    accum.add(x)
+    return f(x)
+def.map(g)
+# Here, accum is still 0 because no actions hvae caused the 'map' to be computed
+```
 
 
